@@ -1,4 +1,5 @@
 import math
+import time
 import torch
 import numpy as np
 from transformers import WhisperForConditionalGeneration, WhisperProcessor, pipeline
@@ -6,80 +7,73 @@ import webrtcvad
 import queue
 import threading
 import pyaudio
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, Tuple
 
 from utils import format_error_message
 
 p = None
 
-def load_models(source_language, destination_language, device):
-    """
-    Load the transcription model and the translation pipeline.
-    """
-    # Load the Whisper transcription model and processor
+def load_models(source_language: str, destination_language: str, device: torch.device) -> Tuple[WhisperForConditionalGeneration, WhisperProcessor, pipeline]:
     transcription_model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-base").to(device)
     transcription_model.config.forced_decoder_ids = None
     processor = WhisperProcessor.from_pretrained("openai/whisper-base", clean_up_tokenization_spaces=False)
 
-    # Load translation pipeline
     translation_pipeline = pipeline("translation", model=f"Helsinki-NLP/opus-mt-{source_language}-{destination_language}", device=device, clean_up_tokenization_spaces=False)
 
     return transcription_model, processor, translation_pipeline
 
-def capture_audio(source_index, source_name, source_language, destination_language, callback, error_callback, executor):
-    """
-    Capture audio from the specified input device and send it for processing in real-time.
-    """
+def capture_audio(source_index: int, source_name: str, source_language: str, destination_language: str, callback, error_callback, executor: ThreadPoolExecutor) -> None:
     global p
     try:
         p = pyaudio.PyAudio()
         vad = webrtcvad.Vad()
-        vad.set_mode(1)  # Set aggressiveness mode for VAD: 0 to 3 (3 is most aggressive)
+        vad.set_mode(1)  # Aggressiveness level
+
         stream = p.open(format=pyaudio.paInt16,
                         channels=1,
                         rate=16000,
                         input=True,
                         input_device_index=source_index,
-                        frames_per_buffer=160)  # Small chunks for responsiveness
+                        frames_per_buffer=160)  # Small chunks
 
-        frames = []
-        min_duration = 250 # in ms
-        silence_threshold = 25  # Adjust based on desired sensitivity
-        silent_time = float(0)
-        speaking = False
-        audio_queue = queue.Queue()
-
-        def process_queue():
-            while True:
-                audio_data = audio_queue.get()
-                if audio_data is None:  # Exit signal
-                    break
-                executor.submit(callback, audio_data, source_name, source_language, destination_language)
-                audio_queue.task_done()
-
-        # Start a thread to process the audio queue
-        threading.Thread(target=process_queue, daemon=True).start()
+        buffer = []
+        silent_time = 0
+        speaking_time = 0
+        min_silent_duration = 0.1  # seconds
+        min_duration = 30  # seconds for Whisper model
+        time_threshold = 1
+        is_speaking = False
 
         while True:
             data = stream.read(160, exception_on_overflow=False)
-
-            # Detect speech
             is_speech = vad.is_speech(data, 16000)
 
             if is_speech:
-                silent_time = float(0)
-                speaking = True
-            else:
-                audio_data = np.frombuffer(data, dtype=np.int16)
-                silent_time += audio_data.shape[-1] / float(16)
+                silent_time = 0
+                is_speaking = True
+            elif is_speaking:
+                silent_time += 160 / 16000.0
 
-            # Accumulate speech frames until sufficient silence is detected
-            if speaking:
-                frames.append(data)
-                audio_data = np.frombuffer(b''.join(frames), dtype=np.int16)
-                if silent_time >= silence_threshold and audio_data.shape[-1] / float(16) >= min_duration:
-                    audio_queue.put(audio_data.astype(np.float32) / np.iinfo(np.int16).max)
-                    frames = []
-                    speaking = False
+            if is_speaking:
+                buffer.append(data)
+                speaking_time += 160 / 16000.0
+                if silent_time >= min_silent_duration:
+                    audio_data = np.frombuffer(b''.join(buffer), dtype=np.int16).astype(np.float32) / np.iinfo(np.int16).max
+                    if len(audio_data) < 16000 * min_duration:
+                        padding = np.zeros(16000 * min_duration - len(audio_data), dtype=np.float32)
+                        audio_data = np.concatenate([audio_data, padding])
+
+                    # Submit final chunk with a finalization flag
+                    callback((source_name, audio_data, source_language, destination_language, True))
+
+                    buffer = []
+                    is_speaking = False
+                elif speaking_time >= time_threshold:
+                    audio_data = np.frombuffer(b''.join(buffer), dtype=np.int16).astype(np.float32) / np.iinfo(np.int16).max
+                    callback((source_name, audio_data, source_language, destination_language, False))
+            else:
+                speaking_time = 0
 
     except Exception as e:
         error_callback(e)
@@ -88,43 +82,33 @@ def capture_audio(source_index, source_name, source_language, destination_langua
         stream.stop_stream()
         stream.close()
         p.terminate()
-        audio_queue.put(None)  # Signal the processing thread to exit
 
-def process_audio_streaming(audio_data: np.ndarray, source_name: str, source_language: str, destination_language: str, transcription_model: WhisperForConditionalGeneration, processor: WhisperProcessor, translation_pipeline, message_queue):
+def process_audio_streaming(
+    audio_data: np.ndarray,
+    source_name: str,
+    source_language: str,
+    destination_language: str,
+    transcription_model: WhisperForConditionalGeneration,
+    processor: WhisperProcessor,
+    translation_pipeline,
+    message_queue: queue.Queue,
+    final: bool = False
+) -> None:
     """
     Process the captured audio stream, including transcription and translation.
     """
     try:
-        # Ensure the audio data is of sufficient length for STFT processing
-        min_length = 30
-        input = None
-        # Process audio data with WhisperProcessor
-        if audio_data.shape[-1] / 16000 < min_length:
-            audio_data = np.pad(audio_data, (0, max(0, int(math.ceil((float(min_length) - audio_data.shape[-1] / float(16000)) * float(16000))))), 'constant')
-            input = processor(
-                audio_data,
-                return_tensors="pt",
-                return_attention_mask=True,
-                sampling_rate=16000,
-                language=source_language,
-                device=transcription_model.device
-            )
-        else:
-            input = processor(
-                audio_data,
-                return_tensors="pt",
-                truncation=False,
-                padding="longest",
-                return_attention_mask=True,
-                sampling_rate=16000,
-                language=source_language,
-                device=transcription_model.device
-            )
+        inputs = processor(
+            audio_data,
+            return_tensors="pt",
+            sampling_rate=16000,
+            return_attention_mask=True,
+            language=source_language
+        )
 
-        input_features = input.input_features.to(transcription_model.device)
-        attention_mask = input.attention_mask.to(transcription_model.device)
+        input_features = inputs.input_features.to(transcription_model.device)
+        attention_mask = inputs.attention_mask.to(transcription_model.device)
 
-        # Generate transcription IDs from input features using input_features argument
         generated_ids = transcription_model.generate(
             input_features=input_features,
             attention_mask=attention_mask,
@@ -132,17 +116,70 @@ def process_audio_streaming(audio_data: np.ndarray, source_name: str, source_lan
             language=source_language
         )
 
-        # Decode the generated transcription IDs into text in the source language
-        transcriptions = processor.batch_decode(generated_ids, skip_special_tokens=True)
+        transcription = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
-        # Translate the transcription if needed
-        translation = translation_pipeline(transcriptions[0])[0]['translation_text']
+        translation = translation_pipeline(transcription)[0]['translation_text']
 
-        # Send transcription and translation to the message queue
-        message_queue.put((source_name, transcriptions[0], "left"))
-        message_queue.put((source_name, translation, "right"))
+        message_queue.put((source_name, "Transcription", transcription, "left", final))
+        message_queue.put((source_name, "Translation", translation, "right", final))
 
     except Exception as e:
-        # Handle errors and send error message to the queue
         error_message = f"Error processing audio: {format_error_message(e)}"
-        message_queue.put((source_name, error_message, "left"))
+        message_queue.put((source_name, None, error_message, "left", True))
+
+def process_queue(
+    executor: ThreadPoolExecutor,
+    models: Dict[int, Dict[str, object]],
+    processing_queue: queue.Queue,
+    message_queue: queue.Queue
+) -> None:
+    processing_threads = {}
+    while True:
+        try:
+            # Get the next message, blocking until one is available
+            source_name, audio_data, source_language, destination_language, final = processing_queue.get()
+
+            model_info = models[source_name]
+
+            # If a thread is currently processing for this source, check for other messages
+            if source_name in processing_threads and processing_threads[source_name].is_alive():
+                found_final = final
+                next_message = None
+                current_message = (source_name, audio_data, source_language, destination_language, final)
+                for _ in range(processing_queue.qsize()):
+                    next_source_name, next_audio_data, next_source_language, next_destination_language, next_final = processing_queue.get()
+                    if next_source_name != source_name or found_final:
+                        if next_source_name in processing_threads and processing_threads[next_source_name].is_alive():
+                            processing_queue.put((next_source_name, next_audio_data, next_source_language, next_destination_language, next_final))
+                        else:
+                            next_message = (next_source_name, next_audio_data, next_source_language, next_destination_language, next_final)
+                    else:
+                        if next_final:
+                            found_final = True
+                        current_message = (next_source_name, next_audio_data, next_source_language, next_destination_language, next_final)
+
+                processing_queue.queue.appendleft(current_message)
+                if next_message is not None:
+                    processing_queue.queue.appendleft(next_message)
+
+                time.sleep(0.001)
+                continue
+
+            processing_threads[source_name] = threading.Thread(
+                target=process_audio_streaming,
+                args=(
+                    audio_data,
+                    source_name,
+                    source_language,
+                    destination_language,
+                    model_info['transcription_model'],
+                    model_info['processor'],
+                    model_info['translation_pipeline'],
+                    message_queue,
+                    final
+                )
+            )
+            processing_threads[source_name].start()
+
+        except Exception as e:
+            print(f"Error in process_queue: {e}")
